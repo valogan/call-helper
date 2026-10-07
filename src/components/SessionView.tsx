@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import type { Session, SessionDraft, Settings, SourceStatus, TranscriptSource } from '../types';
+import type {
+  Session,
+  SessionDraft,
+  Settings,
+  SourceStatus,
+  TranscriptSegment,
+  TranscriptSource,
+} from '../types';
 import type { ChatMessage } from '../lib/llm';
 import { streamChat } from '../lib/llm';
 import { answerMessages, chatMessages } from '../lib/prompts';
@@ -21,7 +28,7 @@ interface SourceState {
   message?: string;
 }
 
-const WATCH_INTERVAL_MS = 5_000;
+const WATCH_INTERVAL_MS = 2_500;
 const ANSWER_COOLDOWN_MS = 15_000;
 const PERSIST_INTERVAL_MS = 15_000;
 
@@ -50,10 +57,11 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
   const watchAbortRef = useRef<AbortController | null>(null);
   const lastAnswerAtRef = useRef(0);
   const lastQuestionRef = useRef('');
-  const watchedCountRef = useRef(0);
+  const lastWatchedSigRef = useRef('');
   const streamingRef = useRef(false);
   const endingRef = useRef(false);
   const autoAnswerRef = useRef(true);
+  const draftsRef = useRef<Partial<Record<TranscriptSource, string>>>({});
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sessionRef = useRef<Session>({
     id: crypto.randomUUID(),
@@ -76,7 +84,10 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
         sessionRef.current.segments.push(seg);
         setSegments([...sessionRef.current.segments]);
       },
-      onDraft: (source, text) => setDrafts((prev) => ({ ...prev, [source]: text })),
+      onDraft: (source, text) => {
+        draftsRef.current[source] = text;
+        setDrafts((prev) => ({ ...prev, [source]: text }));
+      },
       onSourceStatus: (source, status, message) =>
         setStatuses((prev) => ({ ...prev, [source]: { status, message } })),
     });
@@ -109,6 +120,19 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
     if (el) el.scrollTop = el.scrollHeight;
   }, [segments, drafts]);
 
+  // Committed segments plus the still-growing live captions, so the watcher
+  // and answer prompts see words the moment they are transcribed — not only
+  // after a draft line ages out and gets its timestamp.
+  function effectiveTranscript(): TranscriptSegment[] {
+    const base = sessionRef.current.segments;
+    const extras: TranscriptSegment[] = [];
+    for (const src of ['mic', 'system'] as const) {
+      const text = draftsRef.current[src]?.trim();
+      if (text) extras.push({ id: `draft-${src}`, source: src, text, atMs: 0 });
+    }
+    return extras.length ? [...base, ...extras] : base;
+  }
+
   async function runAnswer(trigger: 'auto' | 'manual', questionText: string): Promise<void> {
     abortRef.current?.abort();
     const controller = new AbortController();
@@ -120,7 +144,7 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
     if (trigger === 'auto') setDetectedQuestion(questionText);
     else setDetectedQuestion('');
     try {
-      const messages = answerMessages(draft, sessionRef.current.segments, trigger);
+      const messages = answerMessages(draft, effectiveTranscript(), trigger);
       let acc = '';
       for await (const delta of streamChat(settings.llm, messages, controller.signal)) {
         acc += delta;
@@ -142,20 +166,23 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
     }
   }
 
-  // The watcher: an LLM periodically reviews the transcript for open questions
-  // from the other side; a new one triggers a drafted answer.
+  // The watcher: an LLM periodically reviews the transcript — including the
+  // live, still-growing captions — for open questions from the other side; a
+  // new one triggers a drafted answer.
   async function watchOnce(): Promise<void> {
     if (!autoAnswerRef.current || endingRef.current || streamingRef.current) return;
-    const segs = sessionRef.current.segments;
-    if (segs.length === 0 || segs.length === watchedCountRef.current) return;
+    const transcript = effectiveTranscript();
+    if (transcript.length === 0) return;
+    const sig = `${transcript.length}:${transcript[transcript.length - 1].text}`;
+    if (sig === lastWatchedSigRef.current) return;
     if (Date.now() - lastAnswerAtRef.current < ANSWER_COOLDOWN_MS) return;
-    watchedCountRef.current = segs.length;
+    lastWatchedSigRef.current = sig;
     watchAbortRef.current?.abort();
     const controller = new AbortController();
     watchAbortRef.current = controller;
     const watcherLlm = { ...settings.llm, model: settings.llm.watcherModel.trim() || settings.llm.model };
     try {
-      const question = await detectOpenQuestion(watcherLlm, segs, controller.signal);
+      const question = await detectOpenQuestion(watcherLlm, transcript, controller.signal);
       setWatcherError('');
       if (
         !question ||

@@ -13,9 +13,9 @@ no server: **bring your own provider, your keys never leave your browser.**
   call's audio via tab/screen sharing) stream into the transcript as they're spoken,
   using a rolling-window pipeline over any Whisper-compatible API, or Chrome's built-in
   recognizer for the mic.
-- **LLM question watcher** — a second, always-on LLM call reviews the transcript every
-  few seconds and detects the latest *open* question from the other side (configurable
-  to a small/cheap model).
+- **LLM question watcher** — a second, always-on LLM call scans the transcript
+  (committed lines *and* live captions) every ~2.5 s and detects the latest *open*
+  question from the other side (configurable to a small/cheap model).
 - **Auto Answer** — when the watcher spots a question, a drafted reply streams in.
 - **Answer now** — on-demand drafting of a response to the current exchange.
 - **In-call chat** — ask the AI anything about the ongoing conversation.
@@ -102,7 +102,9 @@ transcribed. Consecutive windows overlap, and a word-level alignment (tail of th
 previous result ↔ head of the next) appends only genuinely new words to a live
 draft — so words appear ~2 s after being spoken, with any provider. The draft
 rotates into the permanent transcript as it ages. The question watcher runs
-separately every ~5 s; point it at a small model in Settings to keep it cheap.
+separately every ~2.5 s over the committed transcript *plus* the live captions,
+so answers can start while the other side is still finishing their sentence;
+point it at a small model in Settings to keep it cheap.
 
 ## Limitations & roadmap
 

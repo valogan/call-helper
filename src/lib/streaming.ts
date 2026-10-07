@@ -69,7 +69,9 @@ export class StreamingTranscriber {
     opts: TranscriberOptions,
     private cb: TranscriberCallbacks,
   ) {
-    this.flushAgeMs = (opts.windowSeconds + 2 * opts.tickSeconds) * 1000;
+    // Commit a draft once its first words are about to leave the window —
+    // they can no longer be revised, and fresher history helps the watcher.
+    this.flushAgeMs = opts.windowSeconds * 1000;
   }
 
   /** True while a window transcription is in flight (used to skip ticks). */

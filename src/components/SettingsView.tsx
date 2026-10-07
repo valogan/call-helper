@@ -142,8 +142,9 @@ export default function SettingsView({ onBack }: Props) {
               onChange={(e) => setLlm({ watcherModel: e.target.value })}
             />
             <p className="hint">
-              The question watcher runs every ~5 s during a call, so a small, fast, cheap model
-              is ideal (e.g. gpt-5-mini, llama-3.1-8b-instant).
+              The question watcher scans the transcript (including live captions) every ~2.5 s
+              during a call, so a small, fast, cheap model is ideal (e.g. gpt-5-mini,
+              llama-3.1-8b-instant).
             </p>
           </div>
 

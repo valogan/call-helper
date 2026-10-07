@@ -4,10 +4,11 @@ import { streamChat } from './llm';
 const SYSTEM_PROMPT = [
   'You monitor the rolling transcript of a live call in real time.',
   'Lines starting with [Them] are spoken by the other participants; lines starting with [You] are the user\'s own words.',
+  'The transcript is live and may cut off mid-sentence — judge intent, not completeness.',
   'Your single job: find the most recent question asked BY [Them] that the user has NOT yet answered.',
-  'Reply with exactly that question, verbatim from the transcript, and nothing else — no quotes, no commentary.',
+  'If the latest [Them] utterance is a question (even an unfinished one), that is the one — reply with it verbatim, exactly as written, and nothing else.',
   'If there is no open question from [Them] (none was asked, or the user already answered it), reply exactly: NONE',
-  'Questions the user asked of them do not count. If several are open, pick the latest.',
+  'Questions the user asked of them do not count.',
 ].join('\n');
 
 /**

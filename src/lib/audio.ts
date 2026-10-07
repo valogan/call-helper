@@ -1,4 +1,4 @@
-/** Audio capture: microphone + call/tab audio, and chunked recording. */
+/** Audio capture: microphone + call/tab audio, and rolling-window PCM pumping. */
 
 export async function acquireMic(): Promise<MediaStream> {
   return navigator.mediaDevices.getUserMedia({
@@ -23,89 +23,189 @@ export async function acquireSystemAudio(): Promise<MediaStream> {
   });
 }
 
-function pickAudioMime(): string {
-  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
-  if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported) {
-    for (const c of candidates) {
-      if (MediaRecorder.isTypeSupported(c)) return c;
-    }
+const TARGET_RATE = 16_000;
+
+/**
+ * AudioWorklet that forwards PCM in ~128 ms blocks to the main thread.
+ * Inlined as a Blob URL so the app stays a single static bundle.
+ */
+const WORKLET_CODE = `
+class RingFlushProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buf = new Float32Array(2048);
+    this.fill = 0;
   }
-  return '';
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) {
+      for (let i = 0; i < ch.length; i++) {
+        this.buf[this.fill++] = ch[i];
+        if (this.fill === this.buf.length) {
+          this.port.postMessage(this.buf.slice(0));
+          this.fill = 0;
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('ring-flush', RingFlushProcessor);
+`;
+
+function encodeWav(samples: Float32Array, sampleRate: number): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeStr = (offset: number, s: string) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
 }
 
-export interface ChunkPump {
+export interface WindowPump {
+  /** Stops capture; fires one final window with any remaining audio. */
   stop(): void;
 }
 
-/**
- * Record `stream`'s audio as a sequence of self-contained blobs of roughly
- * `chunkSeconds` each. MediaRecorder's built-in timeslicing emits headerless
- * chunks that transcription APIs can't decode individually, so we instead
- * restart the recorder every cycle — each blob is a complete, decodable file.
- */
-export function startChunkPump(
-  stream: MediaStream,
-  chunkSeconds: number,
-  onChunk: (blob: Blob) => void,
-  onEnded?: () => void,
-): ChunkPump {
-  const audioOnly = new MediaStream(stream.getAudioTracks());
-  const mime = pickAudioMime();
-  let recorder: MediaRecorder | null = null;
-  let stopped = false;
+export interface WindowPumpOptions {
+  windowSeconds: number;
+  tickSeconds: number;
+}
 
-  const spawn = () => {
-    if (stopped) return;
-    const options: MediaRecorderOptions = { audioBitsPerSecond: 96_000 };
-    if (mime) options.mimeType = mime;
-    try {
-      recorder = new MediaRecorder(audioOnly, options);
-    } catch {
-      recorder = new MediaRecorder(audioOnly);
-    }
-    const local = recorder;
-    let rotated = false;
-    const rotate = () => {
-      if (rotated) return;
-      rotated = true;
-      if (local.state !== 'inactive') {
-        try {
-          local.stop(); // fires a final ondataavailable with the tail
-        } catch {
-          // already stopped
-        }
+/**
+ * Continuously taps `stream`'s audio into a ring buffer (via an AudioWorklet,
+ * resampled to 16 kHz mono) and every `tickSeconds` hands the last
+ * `windowSeconds` of audio to `onWindow` as a self-contained WAV blob.
+ * Windows overlap, so a streaming transcriber can align consecutive results.
+ */
+export function startWindowPump(
+  stream: MediaStream,
+  opts: WindowPumpOptions,
+  onWindow: (wav: Blob) => void,
+  onEnded?: () => void,
+): WindowPump {
+  let stopped = false;
+  let timer: number | null = null;
+  let context: AudioContext | null = null;
+  const ring: Float32Array[] = [];
+  let ringSamples = 0;
+
+  const consume = (data: Float32Array): void => {
+    let block = data;
+    if (context && context.sampleRate !== TARGET_RATE) {
+      // Context wasn't created at 16 kHz — decimate by averaging.
+      const ratio = context.sampleRate / TARGET_RATE;
+      const outLen = Math.floor(data.length / ratio);
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const start = Math.floor(i * ratio);
+        const end = Math.min(Math.floor((i + 1) * ratio), data.length);
+        let sum = 0;
+        for (let j = start; j < end; j++) sum += data[j];
+        out[i] = sum / Math.max(1, end - start);
       }
-      if (!stopped) spawn();
-    };
-    local.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) onChunk(e.data);
-    };
-    local.onerror = () => rotate();
-    local.start(chunkSeconds * 1000);
-    window.setTimeout(rotate, chunkSeconds * 1000 + 250);
+      block = out;
+    }
+    ring.push(block);
+    ringSamples += block.length;
+    const maxSamples = Math.ceil((opts.windowSeconds + 2) * TARGET_RATE);
+    while (ringSamples > maxSamples && ring.length > 1) {
+      const dropped = ring.shift();
+      if (dropped) ringSamples -= dropped.length;
+    }
+  };
+
+  const snapshotWav = (): Blob => {
+    const want = Math.floor(opts.windowSeconds * TARGET_RATE);
+    const flat = new Float32Array(Math.min(want, ringSamples));
+    let fill = flat.length;
+    for (let i = ring.length - 1; i >= 0 && fill > 0; i--) {
+      const chunk = ring[i];
+      const take = Math.min(chunk.length, fill);
+      flat.set(chunk.subarray(chunk.length - take), fill - take);
+      fill -= take;
+    }
+    return encodeWav(flat, TARGET_RATE);
+  };
+
+  const tick = (): void => {
+    if (stopped) return;
+    if (ringSamples >= TARGET_RATE * 1.5) onWindow(snapshotWav());
+  };
+
+  const cleanup = (): void => {
+    if (timer !== null) window.clearInterval(timer);
+    timer = null;
+    void context?.close().catch(() => undefined);
+    context = null;
+  };
+
+  const setup = async (): Promise<void> => {
+    context = new AudioContext({ sampleRate: TARGET_RATE });
+    void context.resume().catch(() => undefined);
+    const source = context.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
+    // Everything must terminate at destination for the graph to be pulled;
+    // a zero gain node keeps the audio silent (no echo into the call).
+    const silent = context.createGain();
+    silent.gain.value = 0;
+    silent.connect(context.destination);
+    try {
+      const url = URL.createObjectURL(new Blob([WORKLET_CODE], { type: 'application/javascript' }));
+      await context.audioWorklet.addModule(url);
+      URL.revokeObjectURL(url);
+      const node = new AudioWorkletNode(context, 'ring-flush');
+      node.port.onmessage = (e) => consume(e.data as Float32Array);
+      source.connect(node);
+      node.connect(silent);
+    } catch {
+      // AudioWorklet unavailable — fall back to the deprecated (but working) processor.
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      processor.onaudioprocess = (e) => consume(new Float32Array(e.inputBuffer.getChannelData(0)));
+      source.connect(processor);
+      processor.connect(silent);
+    }
+    timer = window.setInterval(tick, opts.tickSeconds * 1000);
   };
 
   for (const track of stream.getAudioTracks()) {
     track.addEventListener('ended', () => {
       stopped = true;
-      try {
-        recorder?.stop();
-      } catch {
-        // noop
-      }
+      cleanup();
       onEnded?.();
     });
   }
 
-  spawn();
+  void setup().catch((err: Error) => {
+    stopped = true;
+    cleanup();
+    onEnded?.();
+    console.error('Audio pump failed to start', err);
+  });
+
   return {
     stop() {
       stopped = true;
-      try {
-        recorder?.stop();
-      } catch {
-        // noop
-      }
+      cleanup();
+      if (ringSamples >= TARGET_RATE * 1.5) onWindow(snapshotWav());
     },
   };
 }

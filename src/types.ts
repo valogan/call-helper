@@ -53,6 +53,8 @@ export interface LLMSettings {
   apiKey: string;
   model: string;
   temperature: number;
+  /** Optional smaller model for the always-on question watcher; blank = model. */
+  watcherModel: string;
 }
 
 export type TranscriptionEngine = 'whisper' | 'webspeech';

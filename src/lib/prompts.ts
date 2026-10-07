@@ -6,7 +6,7 @@ const SPEAKER_LABEL: Record<TranscriptSegment['source'], string> = {
   system: 'Them',
 };
 
-export function transcriptBlock(segments: TranscriptSegment[], windowSize = 14): string {
+export function transcriptBlock(segments: TranscriptSegment[], windowSize = 20): string {
   return segments
     .slice(-windowSize)
     .map((s) => `[${SPEAKER_LABEL[s.source]}] ${s.text}`)

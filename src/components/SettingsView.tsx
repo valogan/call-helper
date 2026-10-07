@@ -132,6 +132,21 @@ export default function SettingsView({ onBack }: Props) {
             </div>
           </div>
 
+          <div className="field">
+            <label htmlFor="llm-watcher">Watcher model (optional)</label>
+            <input
+              id="llm-watcher"
+              className="input"
+              placeholder="blank = same as Model — e.g. a small fast model"
+              value={settings.llm.watcherModel}
+              onChange={(e) => setLlm({ watcherModel: e.target.value })}
+            />
+            <p className="hint">
+              The question watcher runs every ~5 s during a call, so a small, fast, cheap model
+              is ideal (e.g. gpt-5-mini, llama-3.1-8b-instant).
+            </p>
+          </div>
+
           <div className="field-pair">
             <div className="field">
               <label htmlFor="llm-model">Model</label>
@@ -258,8 +273,8 @@ export default function SettingsView({ onBack }: Props) {
                   onChange={(e) => setTs({ chunkSeconds: Number(e.target.value) })}
                 />
                 <p className="hint">
-                  Audio is transcribed in chunks of this length — shorter is more real-time,
-                  longer gives better accuracy.
+                  Rolling window re-transcribed every 2 s for live captions — longer windows are
+                  more accurate but cost roughly window÷2 × the provider's audio rate.
                 </p>
               </div>
             </>

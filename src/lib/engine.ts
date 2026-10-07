@@ -1,23 +1,32 @@
 import type { TranscriptSegment, TranscriptSource, TranscriptionSettings } from '../types';
-import { acquireMic, acquireSystemAudio, startChunkPump } from './audio';
-import { transcribeBlob, WebSpeechEngine } from './transcribe';
+import { acquireMic, acquireSystemAudio, startWindowPump } from './audio';
+import { WebSpeechEngine } from './transcribe';
+import { StreamingTranscriber } from './streaming';
 
 export interface EngineCallbacks {
   onSegment(segment: TranscriptSegment): void;
+  /** Live (uncommitted) caption text for a source; '' clears it. */
+  onDraft(source: TranscriptSource, text: string): void;
   onSourceStatus(source: TranscriptSource, status: 'live' | 'ended' | 'error', message?: string): void;
 }
 
+const TICK_SECONDS = 2;
+
 /**
- * Owns the audio sources and per-source transcription pipelines for one live
- * session. Pure TypeScript — the React layer just consumes the callbacks.
+ * Owns the audio sources and per-source streaming transcription pipelines for
+ * one live session. Pure TypeScript — the React layer just consumes the
+ * callbacks. Words appear within ~TICK_SECONDS of being spoken: a rolling
+ * window of audio is re-transcribed every tick and merged by overlap
+ * alignment, so each source shows a live draft that rotates into segments.
  */
 export class SessionEngine {
-  private startedAt = 0;
   private stopped = false;
+  private startedAtMs = 0;
   private streams: MediaStream[] = [];
-  private pumps: Array<ReturnType<typeof startChunkPump>> = [];
+  private pumps: Array<ReturnType<typeof startWindowPump>> = [];
   private webspeech: WebSpeechEngine | null = null;
-  private chains: Partial<Record<'mic' | 'system', Promise<void>>> = {};
+  private transcribers: StreamingTranscriber[] = [];
+  private chains = new Map<StreamingTranscriber, Promise<void>>();
 
   constructor(
     private ts: TranscriptionSettings,
@@ -26,81 +35,72 @@ export class SessionEngine {
 
   /** Starts the requested sources; rejects with a user-facing message on failure. */
   async start(opts: { mic: boolean; system: boolean }): Promise<void> {
-    this.startedAt = performance.now();
+    this.startedAtMs = performance.now();
     const jobs: Array<Promise<void>> = [];
-
-    if (opts.system) {
-      jobs.push(this.startSystem());
-    }
+    if (opts.system) jobs.push(this.startSource('system', acquireSystemAudio));
     if (opts.mic) {
-      jobs.push(this.ts.engine === 'webspeech' ? this.startWebspeech() : this.startMic());
+      jobs.push(this.ts.engine === 'webspeech' ? this.startWebspeech() : this.startSource('mic', acquireMic));
     }
     await Promise.all(jobs);
   }
 
-  private async startSystem(): Promise<void> {
-    const stream = await acquireSystemAudio();
+  private async startSource(
+    source: 'mic' | 'system',
+    acquire: () => Promise<MediaStream>,
+  ): Promise<void> {
+    const stream = await acquire();
     if (this.stopped) {
       stream.getTracks().forEach((t) => t.stop());
       return;
     }
-    if (stream.getAudioTracks().length === 0) {
+    if (source === 'system' && stream.getAudioTracks().length === 0) {
       stream.getTracks().forEach((t) => t.stop());
       throw new Error(
         'No audio in the shared surface — pick the call\'s tab (or screen) and tick "Also share tab audio".',
       );
     }
     this.streams.push(stream);
-    this.cb.onSourceStatus('system', 'live');
-    this.pumps.push(
-      startChunkPump(
-        stream,
-        this.ts.chunkSeconds,
-        (blob) => this.enqueueBlob('system', blob),
-        () => this.cb.onSourceStatus('system', 'ended'),
-      ),
-    );
-  }
+    this.cb.onSourceStatus(source, 'live');
 
-  private async startMic(): Promise<void> {
-    const stream = await acquireMic();
-    if (this.stopped) {
-      stream.getTracks().forEach((t) => t.stop());
-      return;
-    }
-    this.streams.push(stream);
-    this.cb.onSourceStatus('mic', 'live');
-    this.pumps.push(
-      startChunkPump(
-        stream,
-        this.ts.chunkSeconds,
-        (blob) => this.enqueueBlob('mic', blob),
-        () => this.cb.onSourceStatus('mic', 'ended'),
-      ),
+    const transcriber = new StreamingTranscriber(
+      this.ts,
+      { windowSeconds: this.ts.chunkSeconds, tickSeconds: TICK_SECONDS },
+      {
+        onDraft: (text) => this.cb.onDraft(source, text),
+        onCommit: (text) => this.emitSegment(source, text),
+        onError: (message) => this.cb.onSourceStatus(source, 'error', message),
+      },
     );
+    this.transcribers.push(transcriber);
+
+    const pump = startWindowPump(
+      stream,
+      { windowSeconds: this.ts.chunkSeconds, tickSeconds: TICK_SECONDS },
+      (wav) => this.enqueueWindow(transcriber, wav),
+      () => this.cb.onSourceStatus(source, 'ended'),
+    );
+    this.pumps.push(pump);
   }
 
   private startWebspeech(): Promise<void> {
-    this.webspeech = new WebSpeechEngine(
-      this.ts.language,
-      (text) => this.emitSegment('mic', text),
-      (message) => this.cb.onSourceStatus('mic', 'error', message),
-    );
+    this.webspeech = new WebSpeechEngine(this.ts.language, {
+      onFinal: (text) => {
+        this.emitSegment('mic', text);
+        this.cb.onDraft('mic', '');
+      },
+      onInterim: (text) => this.cb.onDraft('mic', text),
+      onError: (message) => this.cb.onSourceStatus('mic', 'error', message),
+    });
     this.webspeech.start();
     this.cb.onSourceStatus('mic', 'live');
     return Promise.resolve();
   }
 
-  private enqueueBlob(source: 'mic' | 'system', blob: Blob): void {
-    this.chains[source] = (this.chains[source] ?? Promise.resolve()).then(async () => {
-      if (this.stopped) return;
-      try {
-        const text = await transcribeBlob(this.ts, blob);
-        if (text) this.emitSegment(source, text);
-      } catch (err) {
-        this.cb.onSourceStatus(source, 'error', (err as Error).message);
-      }
-    });
+  private enqueueWindow(transcriber: StreamingTranscriber, wav: Blob): void {
+    const chain = (this.chains.get(transcriber) ?? Promise.resolve())
+      .then(() => transcriber.handleWindow(wav))
+      .catch(() => undefined); // handleWindow reports its own errors
+    this.chains.set(transcriber, chain);
   }
 
   private emitSegment(source: TranscriptSource, text: string): void {
@@ -108,16 +108,19 @@ export class SessionEngine {
       id: crypto.randomUUID(),
       source,
       text,
-      atMs: Math.round(performance.now() - this.startedAt),
+      atMs: Math.round(performance.now() - this.startedAtMs),
     });
   }
 
-  /** Stops capture and waits for in-flight transcription chunks to land. */
+  /** Stops capture, lets in-flight windows land, and commits remaining drafts. */
   async stop(): Promise<void> {
     this.stopped = true;
     this.webspeech?.stop();
     this.pumps.forEach((p) => p.stop());
     this.streams.forEach((s) => s.getTracks().forEach((t) => t.stop()));
-    await Promise.allSettled(Object.values(this.chains));
+    // pump.stop() enqueues one final window synchronously, so a single
+    // settle of the chains covers all in-flight transcription.
+    await Promise.allSettled([...this.chains.values()]);
+    this.transcribers.forEach((t) => t.flush());
   }
 }

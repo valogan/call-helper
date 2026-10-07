@@ -3,7 +3,7 @@ import type { Session, SessionDraft, Settings, SourceStatus, TranscriptSource } 
 import type { ChatMessage } from '../lib/llm';
 import { streamChat } from '../lib/llm';
 import { answerMessages, chatMessages } from '../lib/prompts';
-import { looksLikeQuestion } from '../lib/qa';
+import { detectOpenQuestion, sameQuestion } from '../lib/watcher';
 import { SessionEngine } from '../lib/engine';
 import { persistSession } from '../lib/storage';
 import { formatClock, formatTimestamp } from '../lib/format';
@@ -21,17 +21,20 @@ interface SourceState {
   message?: string;
 }
 
-const AUTO_COOLDOWN_MS = 15_000;
+const WATCH_INTERVAL_MS = 5_000;
+const ANSWER_COOLDOWN_MS = 15_000;
 const PERSIST_INTERVAL_MS = 15_000;
 
 export default function SessionView({ draft, settings, onEnded, onCancel }: Props) {
   const [segments, setSegments] = useState<Session['segments']>([]);
+  const [drafts, setDrafts] = useState<Partial<Record<TranscriptSource, string>>>({});
   const [statuses, setStatuses] = useState<Partial<Record<TranscriptSource, SourceState>>>({});
   const [answer, setAnswer] = useState<{ text: string; streaming: boolean; error?: string }>({
     text: '',
     streaming: false,
   });
   const [detectedQuestion, setDetectedQuestion] = useState('');
+  const [watcherError, setWatcherError] = useState('');
   const [chat, setChat] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatStreaming, setChatStreaming] = useState(false);
@@ -44,9 +47,13 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
 
   const engineRef = useRef<SessionEngine | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const lastAutoRef = useRef(0);
+  const watchAbortRef = useRef<AbortController | null>(null);
+  const lastAnswerAtRef = useRef(0);
+  const lastQuestionRef = useRef('');
+  const watchedCountRef = useRef(0);
   const streamingRef = useRef(false);
   const endingRef = useRef(false);
+  const autoAnswerRef = useRef(true);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sessionRef = useRef<Session>({
     id: crypto.randomUUID(),
@@ -60,6 +67,8 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
     chat: [],
   });
 
+  autoAnswerRef.current = autoAnswer;
+
   // Live capture lifecycle.
   useEffect(() => {
     const engine = new SessionEngine(settings.transcription, {
@@ -67,6 +76,7 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
         sessionRef.current.segments.push(seg);
         setSegments([...sessionRef.current.segments]);
       },
+      onDraft: (source, text) => setDrafts((prev) => ({ ...prev, [source]: text })),
       onSourceStatus: (source, status, message) =>
         setStatuses((prev) => ({ ...prev, [source]: { status, message } })),
     });
@@ -97,13 +107,15 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [segments]);
+  }, [segments, drafts]);
 
   async function runAnswer(trigger: 'auto' | 'manual', questionText: string): Promise<void> {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
     streamingRef.current = true;
+    lastAnswerAtRef.current = Date.now();
+    if (questionText) lastQuestionRef.current = questionText;
     setAnswer({ text: '', streaming: true });
     if (trigger === 'auto') setDetectedQuestion(questionText);
     else setDetectedQuestion('');
@@ -130,17 +142,41 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
     }
   }
 
-  // Auto Answer: react to newly transcribed questions.
+  // The watcher: an LLM periodically reviews the transcript for open questions
+  // from the other side; a new one triggers a drafted answer.
+  async function watchOnce(): Promise<void> {
+    if (!autoAnswerRef.current || endingRef.current || streamingRef.current) return;
+    const segs = sessionRef.current.segments;
+    if (segs.length === 0 || segs.length === watchedCountRef.current) return;
+    if (Date.now() - lastAnswerAtRef.current < ANSWER_COOLDOWN_MS) return;
+    watchedCountRef.current = segs.length;
+    watchAbortRef.current?.abort();
+    const controller = new AbortController();
+    watchAbortRef.current = controller;
+    const watcherLlm = { ...settings.llm, model: settings.llm.watcherModel.trim() || settings.llm.model };
+    try {
+      const question = await detectOpenQuestion(watcherLlm, segs, controller.signal);
+      setWatcherError('');
+      if (
+        !question ||
+        endingRef.current ||
+        streamingRef.current ||
+        !autoAnswerRef.current ||
+        sameQuestion(question, lastQuestionRef.current)
+      ) {
+        return;
+      }
+      void runAnswer('auto', question);
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') setWatcherError((err as Error).message);
+    }
+  }
+
   useEffect(() => {
-    if (!autoAnswer || streamingRef.current || endingRef.current) return;
-    const last = segments[segments.length - 1];
-    if (!last || !looksLikeQuestion(last.text)) return;
-    const now = Date.now();
-    if (now - lastAutoRef.current < AUTO_COOLDOWN_MS) return;
-    lastAutoRef.current = now;
-    void runAnswer('auto', last.text);
+    const timer = window.setInterval(() => void watchOnce(), WATCH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segments, autoAnswer]);
+  }, []);
 
   async function sendChat(): Promise<void> {
     const text = chatInput.trim();
@@ -194,6 +230,7 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
       if (!window.confirm('Leave now? Captured audio will not be saved.')) return;
     }
     abortRef.current?.abort();
+    watchAbortRef.current?.abort();
     onCancel();
   };
 
@@ -203,6 +240,7 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
     endingRef.current = true;
     setEnding(true);
     abortRef.current?.abort();
+    watchAbortRef.current?.abort();
     await engineRef.current?.stop();
     const session: Session = { ...sessionRef.current, endedAt: Date.now() };
     onEnded(session);
@@ -225,6 +263,10 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
       </span>
     );
   };
+
+  const activeDrafts = (['mic', 'system'] as const)
+    .filter((src) => drafts[src]?.trim())
+    .map((src) => ({ src, text: drafts[src]!.trim() }));
 
   return (
     <div className="page page-live">
@@ -262,9 +304,9 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
 
       <div className="live-grid">
         <section className="transcript" ref={scrollRef}>
-          {segments.length === 0 && (
+          {segments.length === 0 && activeDrafts.length === 0 && (
             <p className="muted transcript-empty">
-              Listening… transcript lines will appear here as they are transcribed.
+              Listening… words will appear here as they are spoken.
             </p>
           )}
           {segments.map((seg) => (
@@ -274,6 +316,15 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
                 {seg.source === 'mic' ? 'You' : 'Them'}
               </span>
               <span className="seg-text">{seg.text}</span>
+            </div>
+          ))}
+          {activeDrafts.map(({ src, text }) => (
+            <div key={`draft-${src}`} className="seg seg-interim">
+              <span className="seg-time">…</span>
+              <span className={`seg-tag ${src === 'mic' ? 'tag-you' : 'tag-them'}`}>
+                {src === 'mic' ? 'You' : 'Them'}
+              </span>
+              <span className="seg-text">{text}</span>
             </div>
           ))}
         </section>
@@ -298,6 +349,9 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
               </div>
             </div>
             {detectedQuestion && <p className="detected-q">“{detectedQuestion}”</p>}
+            {watcherError && (
+              <p className="watcher-err">Watcher: {watcherError}</p>
+            )}
             {answer.error && <div className="banner banner-error">{answer.error}</div>}
             <div className="answer-body">
               {answer.text ? (
@@ -306,7 +360,7 @@ export default function SessionView({ draft, settings, onEnded, onCancel }: Prop
                 <p className="muted">
                   {answer.streaming
                     ? 'Thinking…'
-                    : 'Auto Answer drafts a reply when a question is detected — or press “Answer now”.'}
+                    : 'The watcher LLM reviews the transcript every few seconds and drafts a reply when a question from the other side is detected — or press “Answer now”.'}
                 </p>
               )}
             </div>

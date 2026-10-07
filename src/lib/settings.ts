@@ -8,6 +8,7 @@ export const DEFAULT_SETTINGS: Settings = {
     apiKey: '',
     model: 'gpt-5-mini',
     temperature: 0.4,
+    watcherModel: '',
   },
   transcription: {
     engine: 'whisper',

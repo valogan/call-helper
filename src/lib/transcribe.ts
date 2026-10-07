@@ -9,7 +9,8 @@ export async function transcribeBlob(
   signal?: AbortSignal,
 ): Promise<string> {
   const form = new FormData();
-  form.append('file', blob, 'audio.webm');
+  // Providers sniff by filename extension — WAV windows vs WebSpeech-era webm.
+  form.append('file', blob, blob.type.includes('wav') ? 'audio.wav' : 'audio.webm');
   form.append('model', ts.model);
   if (ts.language) form.append('language', ts.language);
 
@@ -85,14 +86,17 @@ export class WebSpeechEngine {
 
   constructor(
     private lang: string,
-    private onFinal: (text: string) => void,
-    private onError: (message: string) => void,
+    private handlers: {
+      onFinal(text: string): void;
+      onInterim(text: string): void;
+      onError(message: string): void;
+    },
   ) {}
 
   start(): void {
     const SR = getSpeechRecognition();
     if (!SR) {
-      this.onError('SpeechRecognition is not available in this browser — use Chrome, or switch to the Whisper engine.');
+      this.handlers.onError('SpeechRecognition is not available in this browser — use Chrome, or switch to the Whisper engine.');
       return;
     }
     this.active = true;
@@ -108,20 +112,25 @@ export class WebSpeechEngine {
     rec.interimResults = true;
     rec.lang = this.lang || navigator.language;
     rec.onresult = (e: SpeechRecognitionEventLike) => {
+      let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const result = e.results[i];
+        const transcript = result[0]?.transcript?.trim();
+        if (!transcript) continue;
         if (result.isFinal) {
-          const text = result[0]?.transcript?.trim();
-          if (text) this.onFinal(text);
+          this.handlers.onFinal(transcript);
+        } else {
+          interim += `${transcript} `;
         }
       }
+      if (interim.trim()) this.handlers.onInterim(interim.trim());
     };
     rec.onerror = (e: SpeechRecognitionErrorEventLike) => {
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         this.active = false;
-        this.onError('Microphone permission denied for speech recognition.');
+        this.handlers.onError('Microphone permission denied for speech recognition.');
       } else if (e.error === 'network') {
-        this.onError('Speech recognition network error (Chrome routes it through a Google service).');
+        this.handlers.onError('Speech recognition network error (Chrome routes it through a Google service).');
       }
       // 'no-speech' and 'aborted' are benign — onend restarts us.
     };

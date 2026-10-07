@@ -588,6 +588,21 @@ input[type='range'] {
   overflow-wrap: anywhere;
 }
 
+.seg-interim {
+  opacity: 0.62;
+}
+
+.seg-interim .seg-text {
+  font-style: italic;
+}
+
+.watcher-err {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
 .side-panel {
   display: flex;
   flex-direction: column;

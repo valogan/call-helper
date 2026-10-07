@@ -9,10 +9,14 @@ no server: **bring your own provider, your keys never leave your browser.**
 
 ## Features
 
-- **Live transcription** of both sides of the call — your microphone *and* the call's audio
-  (via tab/screen sharing) — using either a Whisper-compatible API or Chrome's built-in
-  speech recognition.
-- **Auto Answer** — detects questions as they're asked and streams a drafted reply.
+- **Live captions, word by word** — both sides of the call (your microphone *and* the
+  call's audio via tab/screen sharing) stream into the transcript as they're spoken,
+  using a rolling-window pipeline over any Whisper-compatible API, or Chrome's built-in
+  recognizer for the mic.
+- **LLM question watcher** — a second, always-on LLM call reviews the transcript every
+  few seconds and detects the latest *open* question from the other side (configurable
+  to a small/cheap model).
+- **Auto Answer** — when the watcher spots a question, a drafted reply streams in.
 - **Answer now** — on-demand drafting of a response to the current exchange.
 - **In-call chat** — ask the AI anything about the ongoing conversation.
 - **Session context** — paste or attach a résumé/notes/playbook, plus free-form custom
@@ -77,29 +81,39 @@ Deliberately boring: a fully static Vite + React + TypeScript SPA, no backend.
 ```
 src/
   lib/
-    audio.ts       mic + display capture; chunked MediaRecorder (self-contained blobs)
-    transcribe.ts  Whisper endpoint client + Chrome WebSpeech engine
-    engine.ts      per-source transcription pipelines for a live session
+    audio.ts       mic + display capture; AudioWorklet ring buffer → 16 kHz mono
+                   WAV windows of the last N seconds, re-sliced every 2 s
+    streaming.ts   overlap-aligned merge of consecutive window transcriptions
+                   into a live draft that rotates into committed segments
+    transcribe.ts  Whisper endpoint client + Chrome WebSpeech engine (interims)
+    engine.ts      per-source streaming pipelines for a live session
+    watcher.ts     LLM call that spots open questions in the rolling transcript
     llm.ts         streaming OpenAI-compatible chat client (SSE)
     prompts.ts     answer / chat / notes prompt builders
-    qa.ts          question-detection heuristic for Auto Answer
     settings.ts    provider presets + local persistence
     storage.ts     session history in localStorage
     export.ts      markdown export
   components/      Home, SettingsView, SessionView (live call), ReviewView
 ```
 
-Transcription chunks are self-contained files (the recorder restarts each cycle, because
-MediaRecorder's timesliced chunks after the first are headerless and APIs can't decode
-them). Answers stream over SSE and are rendered with a tiny built-in markdown renderer.
+**How live transcription works:** an AudioWorklet taps each audio source into a
+ring buffer; every 2 seconds the last ~8 s (configurable) are encoded as WAV and
+transcribed. Consecutive windows overlap, and a word-level alignment (tail of the
+previous result ↔ head of the next) appends only genuinely new words to a live
+draft — so words appear ~2 s after being spoken, with any provider. The draft
+rotates into the permanent transcript as it ages. The question watcher runs
+separately every ~5 s; point it at a small model in Settings to keep it cheap.
 
 ## Limitations & roadmap
 
 - Speaker labels are by *source* (mic vs. call audio), not true diarization.
 - Chrome desktop required for call-audio capture and the browser speech engine.
-- Rough chunk boundaries can occasionally clip a word — increase chunk length for accuracy.
-- Ideas welcome: Electron wrapper (true system-audio capture without tab sharing), PDF
-  résumé parsing, WebSocket-based real-time providers, multi-language UI.
+- The overlap merge is heuristic — occasional repeated or clipped words at window
+  boundaries; longer windows reduce this (at proportionally higher cost, since each
+  tick re-transcribes the whole window: ≈ window÷2 × the provider's audio rate).
+- Ideas welcome: WebSocket streaming-ASR providers (Deepgram, OpenAI Realtime) for
+  provider-side partials, an Electron wrapper for system-audio capture without tab
+  sharing, PDF résumé parsing, multi-language UI.
 
 ## License
 
